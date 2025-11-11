@@ -27,7 +27,7 @@ def download_ccvi():
     logger.info("Connecting to SODA: %s", SODA_DOMAIN)
     client = Socrata(SODA_DOMAIN, None)
     logger.info("Downloading dataset %s", SODA_DATASET_ID)
-    return client.get_all(SODA_DATASET_ID)
+    return list(client.get_all(SODA_DATASET_ID))
 
 
 def upload_to_azure(json_data: str):

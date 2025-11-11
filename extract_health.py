@@ -24,7 +24,7 @@ def validate_config():
 def download_data():
     logger.info("Downloading dataset %s from %s", SODA_DATASET_ID, SODA_DOMAIN)
     client = Socrata(SODA_DOMAIN, None)
-    return client.get_all(SODA_DATASET_ID)
+    return list(client.get_all(SODA_DATASET_ID))
 
 
 def upload_to_azure(json_data: str):
