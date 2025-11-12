@@ -4,16 +4,18 @@ import pandas as pd
 from azure.storage.blob import BlobServiceClient
 from sqlalchemy import create_engine
 import io # Needed to read/write from memory
+import time
 
-print("Starting transformation pipeline for Taxi Trips...")
+print("Starting BATCH transformation pipeline for Taxi Trips...")
 
-# 1. CONFIGURATION 
+# 1. CONFIGURATION
 BRONZE_CONTAINER = "bronze"
 SILVER_CONTAINER = "silver"
-# We now look for a prefix, not a single file name
 BRONZE_BLOB_PREFIX = "taxi_trips_part_" 
-SILVER_BLOB_NAME = "clean_taxi_trips.parquet"
+# We now write to a "folder" in Silver, one file per chunk
+SILVER_BLOB_PREFIX = "clean_taxi_trips/part_"
 connect_str = os.environ.get('AZURE_STORAGE_CONNECTION_STRING')
+CHUNK_SIZE = 50000 # This is for the DB temp table
 
 # Postgres details
 pg_host = os.environ.get('PG_HOST')
@@ -23,118 +25,126 @@ pg_db = "chicago_bi"
 db_url = f"postgresql://{pg_user}:{pg_password}@{pg_host}/{pg_db}"
 db_engine = create_engine(db_url)
 
-# 2. DOWNLOAD AND COMBINE ALL CHUNKS FROM BRONZE 
+blob_service_client = BlobServiceClient.from_connection_string(connect_str)
+
+def clean_and_join_chunk(chunk_df):
+    """
+    Applies the full transformation and spatial join logic to a single DataFrame chunk.
+    """
+    print(f"   ...Transforming {len(chunk_df)} rows...")
+    
+    # 3. CLEAN & PREPARE DATA
+    df = chunk_df.copy()
+    df['trip_start_timestamp'] = pd.to_datetime(df.get('trip_start_timestamp'), errors='coerce')
+    
+    # --- THIS IS THE FIX ---
+    # The column names from Socrata have 'centroid' in them
+    df['pickup_latitude'] = pd.to_numeric(df.get('pickup_centroid_latitude'), errors='coerce')
+    df['pickup_longitude'] = pd.to_numeric(df.get('pickup_centroid_longitude'), errors='coerce')
+    df['dropoff_latitude'] = pd.to_numeric(df.get('dropoff_centroid_latitude'), errors='coerce')
+    df['dropoff_longitude'] = pd.to_numeric(df.get('dropoff_centroid_longitude'), errors='coerce')
+    # --- END FIX ---
+    
+    df.dropna(subset=['trip_id', 'trip_start_timestamp', 'pickup_latitude', 'pickup_longitude'], inplace=True)
+
+    if df.empty:
+        print("   ...Chunk is empty after cleaning.")
+        return None
+
+    locations_df = df[['pickup_latitude', 'pickup_longitude', 'dropoff_latitude', 'dropoff_longitude']].copy()
+    locations_df = locations_df.reset_index().rename(columns={'index': 'temp_trip_id'})
+
+    # 4. SPATIAL JOIN
+    try:
+        with db_engine.connect() as conn:
+            temp_table_name = f'temp_trip_locations_{int(time.time_ns())}' # Unique temp table name
+            
+            locations_df.to_sql(temp_table_name, conn, if_exists='replace', index=False, chunksize=CHUNK_SIZE)
+
+            spatial_join_query = f"""
+                SELECT
+                    t.temp_trip_id,
+                    pickup_geo.geography_key AS pickup_geography_key,
+                    dropoff_geo.geography_key AS dropoff_geography_key
+                FROM
+                    {temp_table_name} AS t
+                LEFT JOIN
+                    dim_geography AS pickup_geo ON ST_Contains(pickup_geo.geom, ST_SetSRID(ST_MakePoint(t.pickup_longitude, t.pickup_latitude), 4326))
+                LEFT JOIN
+                    dim_geography AS dropoff_geo ON ST_Contains(dropoff_geo.geom, ST_SetSRID(ST_MakePoint(t.dropoff_longitude, t.dropoff_latitude), 4326));
+            """
+            geo_keys_df = pd.read_sql(spatial_join_query, conn)
+            
+            conn.execution_options(isolation_level="AUTOCOMMIT").execute(f"DROP TABLE IF EXISTS {temp_table_name};")
+
+    except Exception as e:
+        print(f"   ...ERROR: Spatial join failed for chunk: {e}")
+        return None
+
+    # 5. MERGE & FINALIZE
+    df = df.reset_index().rename(columns={'index': 'temp_trip_id'})
+    df_final = df.merge(geo_keys_df, on='temp_trip_id', how='left')
+    
+    print(f"   ...Chunk transformed. Final size: {len(df_final)} rows.")
+    return df_final
+
+def upload_chunk_to_silver(df_chunk, chunk_index):
+    """
+    Uploads a transformed DataFrame chunk to Azure Silver as a Parquet file.
+    """
+    try:
+        silver_blob_name = f"{SILVER_BLOB_PREFIX}{chunk_index:04d}.parquet"
+        print(f"   ...Uploading {silver_blob_name} to Silver...")
+        
+        output_buffer = io.BytesIO()
+        df_chunk.to_parquet(output_buffer, index=False)
+        output_buffer.seek(0)
+        
+        blob_client = blob_service_client.get_blob_client(container=SILVER_CONTAINER, blob=silver_blob_name)
+        blob_client.upload_blob(output_buffer, overwrite=True)
+        
+        print(f"   ...Upload complete for chunk {chunk_index}.")
+        
+    except Exception as e:
+        print(f"   ...ERROR: Failed to upload chunk {chunk_index} to Silver: {e}")
+
+# 2. LOOP, DOWNLOAD, & PROCESS CHUNKS FROM BRONZE
 try:
     print(f"Connecting to Azure container '{BRONZE_CONTAINER}'...")
-    blob_service_client = BlobServiceClient.from_connection_string(connect_str)
     container_client = blob_service_client.get_container_client(BRONZE_CONTAINER)
 
-    all_dfs = [] # A list to hold all our DataFrames
-    
-    print(f"Finding and downloading all blobs with prefix '{BRONZE_BLOB_PREFIX}'...")
+    print(f"Finding all blobs with prefix '{BRONZE_BLOB_PREFIX}'...")
     blob_list = container_client.list_blobs(name_starts_with=BRONZE_BLOB_PREFIX)
     
-    for blob in blob_list:
-        print(f"...Downloading {blob.name}")
-        blob_client = blob_service_client.get_blob_client(container=BRONZE_CONTAINER, blob=blob.name)
-        
-        downloader = blob_client.download_blob()
-        raw_data = json.loads(downloader.readall())
-        temp_df = pd.DataFrame(raw_data)
-        all_dfs.append(temp_df)
-        print(f"   ...Downloaded {len(temp_df)} rows.")
-
-    if not all_dfs:
+    chunk_count = 0
+    blobs_to_process = [blob for blob in blob_list if blob.name.endswith('.json')]
+    
+    if not blobs_to_process:
         print("ERROR: No part files found. Exiting.")
         exit(1)
-
-    # Combine all the individual DataFrames into one master DataFrame
-    print(f"Combining {len(all_dfs)} files into one master DataFrame...")
-    df = pd.concat(all_dfs, ignore_index=True)
-    print(f"...Downloaded a total of {len(df)} rows.")
-
-except Exception as e:
-    print(f"ERROR: Failed to download from Bronze: {e}")
-    exit(1)
-
-# 3. CLEAN & PREPARE DATA
-print("Cleaning and preparing data...")
-# Convert types, turning errors into 'NaN'
-df['trip_start_timestamp'] = pd.to_datetime(df.get('trip_start_timestamp'), errors='coerce')
-df['pickup_latitude'] = pd.to_numeric(df.get('pickup_latitude'), errors='coerce')
-df['pickup_longitude'] = pd.to_numeric(df.get('pickup_longitude'), errors='coerce')
-df['dropoff_latitude'] = pd.to_numeric(df.get('dropoff_latitude'), errors='coerce')
-df['dropoff_longitude'] = pd.to_numeric(df.get('dropoff_longitude'), errors='coerce')
-
-# Drop any rows where essential data is missing
-df.dropna(subset=['trip_id', 'trip_start_timestamp', 'pickup_latitude', 'pickup_longitude'], inplace=True)
-
-# Create a clean DataFrame of just the locations we need to look up
-# We add a unique index to join on later
-locations_df = df[['pickup_latitude', 'pickup_longitude', 'dropoff_latitude', 'dropoff_longitude']].copy()
-locations_df = locations_df.reset_index().rename(columns={'index': 'temp_trip_id'})
-print(f"Cleaned data, {len(locations_df)} rows to geocode.")
-
-
-# 4. PERFORM SPATIAL JOIN (The Fast Way) 
-print("Performing high-speed spatial join...")
-try:
-    with db_engine.connect() as conn:
-        # Upload locations to a temporary table
-        print("Uploading locations to temp table...")
-        # Use chunksize for better performance with large data
-        locations_df.to_sql('temp_trip_locations', conn, if_exists='replace', index=False, chunksize=10000)
-        print("...Upload complete.")
-
-        # Run ONE single query to join everything using PostGIS
-        print("Running SQL spatial join...")
-        spatial_join_query = """
-            SELECT
-                t.temp_trip_id,
-                pickup_geo.geography_key AS pickup_geography_key,
-                dropoff_geo.geography_key AS dropoff_geography_key
-            FROM
-                temp_trip_locations AS t
-            LEFT JOIN
-                dim_geography AS pickup_geo ON ST_Contains(pickup_geo.geom, ST_SetSRID(ST_MakePoint(t.pickup_longitude, t.pickup_latitude), 4326))
-            LEFT JOIN
-                dim_geography AS dropoff_geo ON ST_Contains(dropoff_geo.geom, ST_SetSRID(ST_MakePoint(t.dropoff_longitude, t.dropoff_latitude), 4326));
-        """
         
-        # Get the results back into a new DataFrame
-        geo_keys_df = pd.read_sql(spatial_join_query, conn)
+    print(f"Found {len(blobs_to_process)} chunks to process.")
+
+    for blob in blobs_to_process:
+        chunk_count += 1
+        print(f"Processing chunk {chunk_count}: {blob.name}")
         
-        # Clean up the temp table
-        conn.execute("DROP TABLE IF EXISTS temp_trip_locations;")
-        print("...Spatial join complete.")
+        # 2a. DOWNLOAD CHUNK
+        blob_client = blob_service_client.get_blob_client(container=BRONZE_CONTAINER, blob=blob.name)
+        downloader = blob_client.download_blob()
+        raw_data = json.loads(downloader.readall())
+        df_chunk_raw = pd.DataFrame(raw_data)
+        print(f"   ...Downloaded {len(df_chunk_raw)} rows.")
+
+        # 2b. TRANSFORM CHUNK
+        df_chunk_final = clean_and_join_chunk(df_chunk_raw)
+        
+        # 2c. UPLOAD CLEAN CHUNK
+        if df_chunk_final is not None:
+            upload_chunk_to_silver(df_chunk_final, chunk_count)
+
+    print(f"Taxi transformation pipeline finished successfully. Processed {chunk_count} chunks.")
 
 except Exception as e:
-    print(f"ERROR: Spatial join failed: {e}")
-    exit(1)
-
-# 5. MERGE & FINALIZE 
-print("Merging geography keys back into main dataset...")
-# Add the temp_trip_id to the original dataframe to join
-df = df.reset_index().rename(columns={'index': 'temp_trip_id'})
-# Merge the geography keys back
-df_final = df.merge(geo_keys_df, on='temp_trip_id', how='left')
-print("...Merge complete.")
-
-# 6. UPLOAD TO SILVER
-try:
-    print(f"Uploading {SILVER_BLOB_NAME} to Silver...")
-    # Convert DataFrame to Parquet format in memory
-    output_buffer = io.BytesIO()
-    df_final.to_parquet(output_buffer, index=False)
-    output_buffer.seek(0)
-    
-    # Upload to Silver
-    blob_client = blob_service_client.get_blob_client(container=SILVER_CONTAINER, blob=SILVER_BLOB_NAME)
-    blob_client.upload_blob(output_buffer, overwrite=True)
-    
-    print("...Upload complete.")
-    print("Transformation pipeline finished successfully.")
-    
-except Exception as e:
-    print(f"ERROR: Failed to upload to Silver: {e}")
+    print(f"ERROR: Failed during batch transform process: {e}")
     exit(1)

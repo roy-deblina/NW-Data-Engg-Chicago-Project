@@ -4,13 +4,14 @@ from azure.storage.blob import BlobServiceClient
 from sqlalchemy import create_engine
 import io
 
-print("Starting load pipeline for Fact Trips...")
+print("Starting BATCH load pipeline for Fact Trips...")
 
-# 1. CONFIGURATION 
+# 1. CONFIGURATION
 SILVER_CONTAINER = "silver"
-TAXI_BLOB_NAME = "clean_taxi_trips.parquet"
-TNP_BLOB_NAME = "clean_tnp_trips.parquet"
+TAXI_BLOB_PREFIX = "clean_taxi_trips/"
+TNP_BLOB_PREFIX = "clean_tnp_trips/"
 connect_str = os.environ.get('AZURE_STORAGE_CONNECTION_STRING')
+DB_TABLE_NAME = "fact_trips"
 
 # Postgres details
 pg_host = os.environ.get('PG_HOST')
@@ -20,49 +21,8 @@ pg_db = "chicago_bi"
 db_url = f"postgresql://{pg_user}:{pg_password}@{pg_host}/{pg_db}"
 db_engine = create_engine(db_url)
 
-# 2. DOWNLOAD & COMBINE DATA
-try:
-    blob_service_client = BlobServiceClient.from_connection_string(connect_str)
-    
-    # Download Taxi data
-    print(f"Downloading {TAXI_BLOB_NAME} from Silver...")
-    taxi_blob_client = blob_service_client.get_blob_client(container=SILVER_CONTAINER, blob=TAXI_BLOB_NAME)
-    taxi_data_bytes = taxi_blob_client.download_blob().readall()
-    df_taxi = pd.read_parquet(io.BytesIO(taxi_data_bytes))
-    df_taxi['trip_source'] = 'Taxi' # Add trip_source
-    print(f"...Downloaded {len(df_taxi)} Taxi rows.")
-
-    # Download TNP data
-    print(f"Downloading {TNP_BLOB_NAME} from Silver...")
-    tnp_blob_client = blob_service_client.get_blob_client(container=SILVER_CONTAINER, blob=TNP_BLOB_NAME)
-    tnp_data_bytes = tnp_blob_client.download_blob().readall()
-    df_tnp = pd.read_parquet(io.BytesIO(tnp_data_bytes))
-    df_tnp['trip_source'] = 'TNP' # Add trip_source
-    print(f"...Downloaded {len(df_tnp)} TNP rows.")
-
-    # Combine them into one DataFrame
-    df_combined = pd.concat([df_taxi, df_tnp], ignore_index=True)
-    print(f"Total trips to load: {len(df_combined)}")
-
-except Exception as e:
-    print(f"ERROR: Failed to download from Silver: {e}")
-    exit(1)
-
-# 3. PREPARE FOR GOLD 
-print("Preparing data for Gold Zone...")
-
-# Create date keys (YYYYMMDD as an integer)
-df_combined['trip_start_timestamp'] = pd.to_datetime(df_combined['trip_start_timestamp'])
-df_combined['trip_start_date_key'] = df_combined['trip_start_timestamp'].dt.strftime('%Y%m%d').astype(int)
-    
-# Handle potential missing end times
-df_combined['trip_end_timestamp'] = pd.to_datetime(df_combined.get('trip_end_timestamp'), errors='coerce')
-df_combined['trip_end_date_key'] = df_combined['trip_end_timestamp'].dt.strftime('%Y%m%d')
-df_combined['trip_end_date_key'].fillna(0, inplace=True) # Use 0 for missing end dates
-df_combined['trip_end_date_key'] = df_combined['trip_end_date_key'].astype(int)
-
-# Select only the columns that match your fact_trips table
-final_columns = [
+# Columns to match fact_trips table
+FINAL_COLUMNS = [
     'trip_id',
     'trip_start_date_key',
     'trip_end_date_key',
@@ -77,26 +37,106 @@ final_columns = [
     'tip',
     'trip_total'
 ]
-    
-# Filter df to only these columns, handling missing ones
-final_df = df_combined.reindex(columns=final_columns)
-print("...Data prepared.")
 
-# 4. LOAD TO GOLD 
-try:
-    print(f"Loading data into {pg_db}.fact_trips...")
-    # 'if_exists='replace'' will wipe the table first. This is good for testing.
+def process_and_load_chunk(df_chunk, trip_source, load_method):
+    """
+    Prepares a single chunk and loads it into the database.
+    """
+    print(f"   ...Preparing {len(df_chunk)} rows from '{trip_source}' source...")
+    df_chunk['trip_source'] = trip_source
+    
+    # Create date keys
+    df_chunk['trip_start_timestamp'] = pd.to_datetime(df_chunk['trip_start_timestamp'])
+    df_chunk['trip_start_date_key'] = df_chunk['trip_start_timestamp'].dt.strftime('%Y%m%d').astype(int)
+        
+    df_chunk['trip_end_timestamp'] = pd.to_datetime(df_chunk.get('trip_end_timestamp'), errors='coerce')
+    df_chunk['trip_end_date_key'] = df_chunk['trip_end_timestamp'].dt.strftime('%Y%m%d')
+    df_chunk['trip_end_date_key'].fillna(0, inplace=True)
+    df_chunk['trip_end_date_key'] = df_chunk['trip_end_date_key'].astype(int)
+
+    # Filter df to only these columns, handling missing ones
+    final_df = df_chunk.reindex(columns=FINAL_COLUMNS)
+    
+    # Load to Gold
+    print(f"   ...Loading chunk to '{DB_TABLE_NAME}' (method: {load_method})...")
     final_df.to_sql(
-        'fact_trips',
+        DB_TABLE_NAME,
         db_engine,
-        if_exists='replace', 
+        if_exists=load_method, 
         index=False,
         method='multi', # Use 'multi' for faster inserts
         chunksize=10000  # Load 10,000 rows at a time
     )
-    print("...Load complete.")
-    print("Load pipeline for Fact Trips finished successfully.")
+    print("   ...Chunk loaded successfully.")
+
+try:
+    print(f"Connecting to Azure container '{SILVER_CONTAINER}'...")
+    blob_service_client = BlobServiceClient.from_connection_string(connect_str)
+    container_client = blob_service_client.get_container_client(SILVER_CONTAINER)
+    
+    is_first_chunk_overall = True # This will control the 'replace' logic
+    
+    # --- STAGE 1: PROCESS TAXI TRIPS ---
+    print(f"--- Processing Taxi Trips (Prefix: {TAXI_BLOB_PREFIX}) ---")
+    taxi_blob_list = container_client.list_blobs(name_starts_with=TAXI_BLOB_PREFIX)
+    
+    taxi_files = [blob for blob in taxi_blob_list if blob.name.endswith('.parquet')]
+    if not taxi_files:
+        print("WARNING: No clean taxi part-files found.")
+    
+    for blob in taxi_files:
+        print(f"...Processing {blob.name}")
         
+        # Download chunk
+        blob_client = blob_service_client.get_blob_client(container=SILVER_CONTAINER, blob=blob.name)
+        downloader = blob_client.download_blob()
+        data_bytes = downloader.readall()
+        df = pd.read_parquet(io.BytesIO(data_bytes))
+        print(f"   ...Downloaded {len(df)} rows.")
+
+        # Determine load method
+        if is_first_chunk_overall:
+            load_method = 'replace'
+            is_first_chunk_overall = False
+        else:
+            load_method = 'append'
+            
+        # Process and load this chunk
+        process_and_load_chunk(df, 'Taxi', load_method)
+
+    # --- STAGE 2: PROCESS TNP TRIPS ---
+    print(f"--- Processing TNP Trips (Prefix: {TNP_BLOB_PREFIX}) ---")
+    tnp_blob_list = container_client.list_blobs(name_starts_with=TNP_BLOB_PREFIX)
+
+    tnp_files = [blob for blob in tnp_blob_list if blob.name.endswith('.parquet')]
+    if not tnp_files:
+        print("WARNING: No clean TNP part-files found.")
+
+    for blob in tnp_files:
+        print(f"...Processing {blob.name}")
+        
+        # Download chunk
+        blob_client = blob_service_client.get_blob_client(container=SILVER_CONTAINER, blob=blob.name)
+        downloader = blob_client.download_blob()
+        data_bytes = downloader.readall()
+        df = pd.read_parquet(io.BytesIO(data_bytes))
+        print(f"   ...Downloaded {len(df)} rows.")
+
+        # Determine load method
+        if is_first_chunk_overall:
+            load_method = 'replace' # This would only happen if no taxi files were found
+            is_first_chunk_overall = False
+        else:
+            load_method = 'append'
+            
+        # Process and load this chunk
+        process_and_load_chunk(df, 'TNP', load_method)
+
+    if is_first_chunk_overall:
+        print("WARNING: No parquet files were found for EITHER taxi or tnp. No data was loaded.")
+    else:
+        print(f"Load pipeline for Fact Trips finished successfully.")
+
 except Exception as e:
-    print(f"ERROR: Failed to load to Gold: {e}")
+    print(f"ERROR: Failed during batch load process: {e}")
     exit(1)

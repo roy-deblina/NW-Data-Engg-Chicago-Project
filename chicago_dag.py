@@ -22,7 +22,7 @@ with DAG(
     default_args=default_args,
     description='Full ETL pipeline for Chicago BI project',
     start_date=datetime(2025, 11, 1),
-    schedule_interval=None, # We will trigger this manually via the API
+    schedule=None, # We will trigger this manually via the API
     catchup=False,
     tags=['chicago', 'bi', 'project']
 ) as dag:
@@ -61,55 +61,55 @@ with DAG(
     # --- 2. TRANSFORM LAYER ---
     # All transform tasks are active and will run.
     
-    task_transform_taxi = BashOperator(
-        task_id='transform_taxi',
-        bash_command=f"python3 {BASE_PATH}transform_taxi.py"
-    )
+    # task_transform_taxi = BashOperator(
+    #     task_id='transform_taxi',
+    #     bash_command=f"python3 {BASE_PATH}transform_taxi.py"
+    # )
     
-    task_transform_tnp = BashOperator(
-        task_id='transform_tnp',
-        bash_command=f"python3 {BASE_PATH}transform_tnp.py"
-    )
+    # task_transform_tnp = BashOperator(
+    #     task_id='transform_tnp',
+    #     bash_command=f"python3 {BASE_PATH}transform_tnp.py"
+    # )
     
     task_transform_permits = BashOperator(
         task_id='transform_permits',
         bash_command=f"python3 {BASE_PATH}transform_permits.py"
     )
     
-    task_transform_covid = BashOperator(
-         task_id='transform_covid',
-         bash_command=f"python3 {BASE_PATH}transform_covid.py"
-    )
-    task_transform_health = BashOperator(
-     task_id='transform_health',
-     bash_command=f"python3 {BASE_PATH}transform_health.py"
-    )
-    task_transform_ccvi = BashOperator(
-        task_id='transform_ccvi',
-        bash_command=f"python3 {BASE_PATH}transform_ccvi.py"
-    )
+    # task_transform_covid = BashOperator(
+    #      task_id='transform_covid',
+    #      bash_command=f"python3 {BASE_PATH}transform_covid.py"
+    # )
+    # task_transform_health = BashOperator(
+    #  task_id='transform_health',
+    #  bash_command=f"python3 {BASE_PATH}transform_health.py"
+    # )
+    # task_transform_ccvi = BashOperator(
+    #     task_id='transform_ccvi',
+    #     bash_command=f"python3 {BASE_PATH}transform_ccvi.py"
+    # )
 
     # --- 3. LOAD LAYER ---
     # All load tasks are active and will run.
     
-    task_load_trips = BashOperator(
-        task_id='load_trips',
-        bash_command=f"python3 {BASE_PATH}load_trips.py"
-    )
+    # task_load_trips = BashOperator(
+    #     task_id='load_trips',
+    #     bash_command=f"python3 {BASE_PATH}load_trips.py"
+    # )
     
     task_load_permits = BashOperator(
         task_id='load_permits',
         bash_command=f"python3 {BASE_PATH}load_permits.py"
     )
     
-    task_load_covid = BashOperator(
-        task_id='load_covid',
-        bash_command=f"python3 {BASE_PATH}load_covid.py"
-    )
-    task_load_health = BashOperator(
-        task_id='load_health',
-        bash_command=f"python3 {BASE_PATH}load_health.py"
-    )
+    # task_load_covid = BashOperator(
+    #     task_id='load_covid',
+    #     bash_command=f"python3 {BASE_PATH}load_covid.py"
+    # )
+    # task_load_health = BashOperator(
+    #     task_id='load_health',
+    #     bash_command=f"python3 {BASE_PATH}load_health.py"
+    # )
     
     # --- 4. SET DEPENDENCIES (The "Master Plan") ---
     # Since all extract tasks are commented, all transform
@@ -117,14 +117,14 @@ with DAG(
     
     # Trips Pipeline:
     # BOTH transform tasks must finish before the load_trips task can run
-    [task_transform_taxi, task_transform_tnp] >> task_load_trips
+    # [task_transform_taxi, task_transform_tnp] >> task_load_trips
     
     # Permits Pipeline:
     task_transform_permits >> task_load_permits
     
     # COVID Pipeline:
-    task_transform_covid >> task_load_covid
+    # task_transform_covid >> task_load_covid
     
     # Health/Socioeconomic Pipeline:
     # BOTH transform tasks must finish before the load_health task can run
-    [task_transform_health, task_transform_ccvi] >> task_load_health
+    # [task_transform_health, task_transform_ccvi] >> task_load_health
