@@ -91,6 +91,3 @@ The project contains the following essential files, organized by function:
 
 ***
 
-## Contact
-
-For any issues related to the cloud environment, database connectivity, or pipeline deployment, please contact **[Your Name] (Cloud Administrator)**.
