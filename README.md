@@ -64,21 +64,6 @@ The trips pipeline combines Taxi and TNP (Transportation Network Provider / Ride
 
 ---
 
-## 3. Orchestration & Execution
-
-### 3.1 Airflow DAG (`chicago_dag.py`)
-
-The DAG defines the dependencies to guarantee data quality and integrity.
-
-**Dependency Logic Example:**
-
-```python
-# Trips Pipeline: Both transformations must finish before the singular, combined load
-[task_transform_taxi, task_transform_tnp] >> task_load_trips
-
-# Permits Pipeline (Sequential)
-task_transform_permits >> task_load_permits
-# ... and so on for all fact tables
 
 
 # 🏙️ Chicago Business Intelligence Project
