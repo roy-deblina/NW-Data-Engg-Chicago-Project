@@ -89,5 +89,5 @@ The project contains the following essential files, organized by function:
 | **Admin** | `check_envs.py` | Utility to verify environment variables. |
 | **Documentation** | `README.md` | This file. |
 
-***
+
 
